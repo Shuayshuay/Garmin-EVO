@@ -22,8 +22,14 @@ from typing import Optional
 
 from garminconnect import Garmin
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("garmin-mcp")
+mcp = FastMCP(
+    "garmin-mcp",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+)
 
 # --- Sesión de Garmin, con reintento de login ---------------------------
 
@@ -136,6 +142,95 @@ def get_weight(start_date: str = "", end_date: str = "") -> dict:
         datetime.date.today() - datetime.timedelta(days=30)
     ).isoformat()
     return client.get_body_composition(s, e)
+
+
+@mcp.tool()
+def schedule_workout(
+    name: str,
+    date: str,
+    sport: str = "running",
+    duration_minutes: float = 0,
+    distance_km: float = 0,
+) -> dict:
+    """Crea un entrenamiento simple (un solo bloque, sin intervalos) y lo
+    programa en tu calendario de Garmin en la fecha indicada.
+
+    Args:
+        name: nombre del entrenamiento, ej. "Rodaje suave".
+        date: fecha en formato YYYY-MM-DD en la que quieres que aparezca
+            en tu calendario de Garmin.
+        sport: "running", "cycling" o "walking".
+        duration_minutes: duración objetivo en minutos (usa esto O
+            distance_km, no ambos).
+        distance_km: distancia objetivo en km (usa esto O
+            duration_minutes, no ambos).
+
+    Nota: esta función usa un endpoint no documentado de Garmin Connect.
+    Es más frágil que las herramientas de solo lectura y puede necesitar
+    ajustes si Garmin cambia su API.
+    """
+    client = get_client()
+
+    sport_map = {
+        "running": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "cycling": {"sportTypeId": 2, "sportTypeKey": "cycling"},
+        "walking": {"sportTypeId": 9, "sportTypeKey": "walking"},
+    }
+    sport_info = sport_map.get(sport, sport_map["running"])
+
+    if distance_km and not duration_minutes:
+        end_condition = {
+            "conditionTypeId": 3,
+            "conditionTypeKey": "distance",
+        }
+        end_condition_value = distance_km * 1000  # metros
+    else:
+        end_condition = {
+            "conditionTypeId": 2,
+            "conditionTypeKey": "time",
+        }
+        end_condition_value = (duration_minutes or 30) * 60  # segundos
+
+    workout_payload = {
+        "workoutName": name,
+        "sportType": sport_info,
+        "workoutSegments": [
+            {
+                "segmentOrder": 1,
+                "sportType": sport_info,
+                "workoutSteps": [
+                    {
+                        "stepOrder": 1,
+                        "stepType": {
+                            "stepTypeId": 3,
+                            "stepTypeKey": "interval",
+                        },
+                        "endCondition": end_condition,
+                        "endConditionValue": end_condition_value,
+                    }
+                ],
+            }
+        ],
+    }
+
+    created = client.connectapi(
+        "/workout-service/workout", method="POST", json=workout_payload
+    )
+    workout_id = created["workoutId"]
+
+    schedule_payload = {"date": date}
+    client.connectapi(
+        f"/workout-service/schedule/{workout_id}",
+        method="POST",
+        json=schedule_payload,
+    )
+
+    return {
+        "status": "programado",
+        "workout_id": workout_id,
+        "nombre": name,
+        "fecha": date,
+    }
 
 
 if __name__ == "__main__":
