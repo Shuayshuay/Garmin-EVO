@@ -1,33 +1,60 @@
 """
 Genera un resumen semanal de tus datos de Garmin y lo envía por email.
 
-Pensado para ejecutarse automáticamente cada lunes vía GitHub Actions
-(ver .github/workflows/weekly-report.yml), NO dentro de una conversación
-de Claude — es un proceso independiente.
+A diferencia de la primera versión, este script NO inicia sesión en Garmin
+directamente (eso provocaba errores de doble factor/MFA al ejecutarse desde
+GitHub Actions). En su lugar, le pide los datos a tu propio servidor MCP ya
+desplegado en Render, que es el único sitio que inicia sesión en Garmin.
 
-Variables de entorno necesarias (se configuran como "Secrets" en GitHub,
-Settings -> Secrets and variables -> Actions):
-  - GARMIN_EMAIL
-  - GARMIN_PASSWORD
+Pensado para ejecutarse automáticamente cada lunes vía GitHub Actions (ver
+.github/workflows/weekly-report.yml).
+
+Variables de entorno necesarias (como "Secrets" en GitHub):
   - GMAIL_ADDRESS        (la cuenta de Gmail desde la que se envía)
   - GMAIL_APP_PASSWORD   (contraseña de aplicación de esa cuenta de Gmail)
   - RECIPIENT_EMAIL      (a qué email quieres que llegue el resumen)
+
+Variable opcional:
+  - MCP_SERVER_URL (por defecto usa tu servidor de Render ya desplegado)
 """
 
 import os
+import json
+import time
 import smtplib
+import asyncio
 import datetime
 from email.mime.text import MIMEText
 
-from garminconnect import Garmin
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+DEFAULT_SERVER_URL = "https://garmin-evo.onrender.com/mcp"
 
 
-def get_week_data():
-    email = os.environ["GARMIN_EMAIL"]
-    password = os.environ["GARMIN_PASSWORD"]
-    client = Garmin(email, password)
-    client.login()
+async def call_tool(server_url: str, name: str, arguments: dict):
+    async with streamablehttp_client(server_url) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(name, arguments)
+            text = result.content[0].text
+            return json.loads(text)
 
+
+async def call_tool_with_retry(server_url: str, name: str, arguments: dict, attempts=5):
+    """El plan gratuito de Render 'duerme' el servidor; reintenta con espera
+    para darle tiempo a despertar."""
+    last_error = None
+    for i in range(attempts):
+        try:
+            return await call_tool(server_url, name, arguments)
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            time.sleep(15)
+    raise last_error
+
+
+async def get_week_data(server_url: str):
     today = datetime.date.today()
     start = today - datetime.timedelta(days=7)
 
@@ -39,7 +66,7 @@ def get_week_data():
     while day <= today:
         d = day.isoformat()
         try:
-            stats = client.get_stats(d)
+            stats = await call_tool_with_retry(server_url, "get_steps", {"date": d})
             steps_total += stats.get("totalSteps") or 0
             rhr = stats.get("restingHeartRate")
             if rhr:
@@ -47,10 +74,8 @@ def get_week_data():
         except Exception:
             pass
         try:
-            sleep = client.get_sleep_data(d)
-            seconds = (
-                sleep.get("dailySleepDTO", {}).get("sleepTimeSeconds") or 0
-            )
+            sleep = await call_tool_with_retry(server_url, "get_sleep", {"date": d})
+            seconds = (sleep.get("dailySleepDTO", {}).get("sleepTimeSeconds") or 0)
             if seconds:
                 sleep_hours.append(seconds / 3600)
         except Exception:
@@ -58,7 +83,9 @@ def get_week_data():
         day += datetime.timedelta(days=1)
 
     try:
-        activities = client.get_activities(0, 20)
+        activities = await call_tool_with_retry(
+            server_url, "get_activities", {"limit": 20}
+        )
         activities = [
             a
             for a in activities
@@ -82,7 +109,7 @@ def get_week_data():
         "activities": [
             {
                 "nombre": a.get("activityName"),
-                "tipo": a.get("activityType", {}).get("typeKey"),
+                "tipo": (a.get("activityType") or {}).get("typeKey"),
                 "distancia_km": round((a.get("distance") or 0) / 1000, 2),
                 "duracion_min": round((a.get("duration") or 0) / 60),
             }
@@ -130,7 +157,8 @@ def send_email(subject: str, body: str):
 
 
 if __name__ == "__main__":
-    data = get_week_data()
+    server_url = os.environ.get("MCP_SERVER_URL", DEFAULT_SERVER_URL)
+    data = asyncio.run(get_week_data(server_url))
     body = build_email_body(data)
     send_email("Tu resumen semanal de Garmin", body)
     print("Email enviado correctamente.")
