@@ -173,6 +173,33 @@ def get_weight(start_date: str = "", end_date: str = "") -> dict:
 
 
 @mcp.tool()
+def get_activity_splits(activity_id: int) -> dict:
+    """Devuelve los splits (parciales por km/milla) de una actividad
+    concreta. Usa el activity_id que devuelve get_activities."""
+    client = get_client()
+    return client.get_activity_splits(activity_id)
+
+
+@mcp.tool()
+def get_vo2max(date: str = "") -> dict:
+    """Devuelve las métricas máximas (VO2max, edad de fitness) de un día
+    (formato YYYY-MM-DD). Si no se indica fecha, usa el día de hoy."""
+    client = get_client()
+    d = date or _today()
+    return client.get_max_metrics(d)
+
+
+@mcp.tool()
+def get_training_status(date: str = "") -> dict:
+    """Devuelve el estado de entrenamiento (carga, VO2max, recuperación,
+    indicadores de forma) de un día (formato YYYY-MM-DD). Si no se indica
+    fecha, usa el día de hoy."""
+    client = get_client()
+    d = date or _today()
+    return client.get_training_status(d)
+
+
+@mcp.tool()
 def get_activity_weather(activity_id: int) -> dict:
     """Devuelve las condiciones climáticas (temperatura, humedad, viento...)
     registradas durante una actividad concreta. Usa el activity_id que
@@ -274,6 +301,18 @@ def _hr_target(bpm_low: int, bpm_high: int) -> dict:
     }
 
 
+def _apply_target(step, target: dict):
+    """Aplica un target (ritmo o FC) a un step, sea cual sea el tipo de
+    objeto que devuelvan los create_*_step de la librería (dict o
+    dataclass)."""
+    if isinstance(step, dict):
+        step.update(target)
+    else:
+        for key, value in target.items():
+            setattr(step, key, value)
+    return step
+
+
 @mcp.tool()
 def schedule_interval_workout(
     name: str,
@@ -345,9 +384,11 @@ def schedule_interval_workout(
             work_duration_seconds or 240, step_order=1
         )
     if pace_slow_min_per_km and pace_fast_min_per_km:
-        work_step.update(_pace_target(pace_slow_min_per_km, pace_fast_min_per_km))
+        work_step = _apply_target(
+            work_step, _pace_target(pace_slow_min_per_km, pace_fast_min_per_km)
+        )
     elif hr_low_bpm and hr_high_bpm:
-        work_step.update(_hr_target(hr_low_bpm, hr_high_bpm))
+        work_step = _apply_target(work_step, _hr_target(hr_low_bpm, hr_high_bpm))
 
     recovery_step = gc_workout.create_recovery_step(
         recovery_duration_seconds, step_order=2
