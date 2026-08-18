@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from garminconnect import Garmin
+from garminconnect import workout as gc_workout
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -191,70 +192,47 @@ def schedule_workout(
             distance_km, no ambos).
         distance_km: distancia objetivo en km (usa esto O
             duration_minutes, no ambos).
-
-    Nota: esta función usa un endpoint no documentado de Garmin Connect.
-    Es más frágil que las herramientas de solo lectura y puede necesitar
-    ajustes si Garmin cambia su API.
     """
     client = get_client()
 
     sport_map = {
-        "running": {"sportTypeId": 1, "sportTypeKey": "running"},
-        "cycling": {"sportTypeId": 2, "sportTypeKey": "cycling"},
-        "walking": {"sportTypeId": 9, "sportTypeKey": "walking"},
+        "running": ("RunningWorkout", {"sportTypeId": 1, "sportTypeKey": "running"}),
+        "cycling": ("CyclingWorkout", {"sportTypeId": 2, "sportTypeKey": "cycling"}),
+        "walking": ("WalkingWorkout", {"sportTypeId": 9, "sportTypeKey": "walking"}),
     }
-    sport_info = sport_map.get(sport, sport_map["running"])
+    class_name, sport_info = sport_map.get(sport, sport_map["running"])
+    WorkoutClass = getattr(gc_workout, class_name, gc_workout.RunningWorkout)
 
     if distance_km and not duration_minutes:
-        end_condition = {
-            "conditionTypeId": 3,
-            "conditionTypeKey": "distance",
-        }
-        end_condition_value = distance_km * 1000  # metros
+        step = gc_workout.create_distance_interval_step(
+            distance_km * 1000, step_order=1
+        )
+        est_duration = 0
     else:
-        end_condition = {
-            "conditionTypeId": 2,
-            "conditionTypeKey": "time",
-        }
-        end_condition_value = (duration_minutes or 30) * 60  # segundos
+        duration_seconds = (duration_minutes or 30) * 60
+        step = gc_workout.create_interval_step(duration_seconds, step_order=1)
+        est_duration = duration_seconds
 
-    workout_payload = {
-        "workoutName": name,
-        "sportType": sport_info,
-        "workoutSegments": [
-            {
-                "segmentOrder": 1,
-                "sportType": sport_info,
-                "workoutSteps": [
-                    {
-                        "stepOrder": 1,
-                        "stepType": {
-                            "stepTypeId": 3,
-                            "stepTypeKey": "interval",
-                        },
-                        "endCondition": end_condition,
-                        "endConditionValue": end_condition_value,
-                    }
-                ],
-            }
+    workout = WorkoutClass(
+        workoutName=name,
+        estimatedDurationInSecs=est_duration,
+        workoutSegments=[
+            gc_workout.WorkoutSegment(
+                segmentOrder=1, sportType=sport_info, workoutSteps=[step]
+            )
         ],
-    }
-
-    created = client.connectapi(
-        "/workout-service/workout", method="POST", json=workout_payload
     )
-    workout_id = created["workoutId"]
 
-    schedule_payload = {"date": date}
-    client.connectapi(
-        f"/workout-service/schedule/{workout_id}",
-        method="POST",
-        json=schedule_payload,
-    )
+    upload_method = getattr(client, f"upload_{sport}_workout", None)
+    if upload_method is None:
+        upload_method = client.upload_running_workout
+
+    result = upload_method(workout)
+    client.schedule_workout(result["workoutId"], date)
 
     return {
         "status": "programado",
-        "workout_id": workout_id,
+        "workout_id": result["workoutId"],
         "nombre": name,
         "fecha": date,
     }
