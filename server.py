@@ -173,6 +173,19 @@ def get_weight(start_date: str = "", end_date: str = "") -> dict:
 
 
 @mcp.tool()
+def get_activity_weather(activity_id: int) -> dict:
+    """Devuelve las condiciones climáticas (temperatura, humedad, viento...)
+    registradas durante una actividad concreta. Usa el activity_id que
+    devuelve get_activities."""
+    client = get_client()
+    method = getattr(client, "get_activity_weather", None)
+    if method is not None:
+        return method(activity_id)
+    # Respaldo si esta versión de la librería no trae el método directo.
+    return client.connectapi(f"/activity-service/activity/{activity_id}/weather")
+
+
+@mcp.tool()
 def schedule_workout(
     name: str,
     date: str,
@@ -235,6 +248,151 @@ def schedule_workout(
         "workout_id": result["workoutId"],
         "nombre": name,
         "fecha": date,
+    }
+
+
+def _pace_target(min_per_km_slow: float, min_per_km_fast: float) -> dict:
+    """Convierte un rango de ritmo (min/km) al formato que espera Garmin
+    (velocidad en m/s, de más lento a más rápido)."""
+    speed_slow = 1000.0 / (min_per_km_slow * 60.0)
+    speed_fast = 1000.0 / (min_per_km_fast * 60.0)
+    return {
+        "targetType": {"workoutTargetTypeId": 6, "workoutTargetTypeKey": "pace.zone"},
+        "targetValueOne": min(speed_slow, speed_fast),
+        "targetValueTwo": max(speed_slow, speed_fast),
+    }
+
+
+def _hr_target(bpm_low: int, bpm_high: int) -> dict:
+    return {
+        "targetType": {
+            "workoutTargetTypeId": 4,
+            "workoutTargetTypeKey": "heart.rate.zone",
+        },
+        "targetValueOne": min(bpm_low, bpm_high),
+        "targetValueTwo": max(bpm_low, bpm_high),
+    }
+
+
+@mcp.tool()
+def schedule_interval_workout(
+    name: str,
+    date: str,
+    repeat_count: int,
+    work_distance_m: float = 0,
+    work_duration_seconds: float = 0,
+    recovery_duration_seconds: float = 90,
+    warmup_minutes: float = 15,
+    cooldown_minutes: float = 10,
+    pace_slow_min_per_km: float = 0,
+    pace_fast_min_per_km: float = 0,
+    hr_low_bpm: int = 0,
+    hr_high_bpm: int = 0,
+    sport: str = "running",
+) -> dict:
+    """Crea y programa un entrenamiento de SERIES (con calentamiento,
+    repeticiones de trabajo + recuperación, y enfriamiento) en el
+    calendario de Garmin. Pensado para sesiones tipo "6x1000m a ritmo X
+    con 90s de recuperación".
+
+    Args:
+        name: nombre del entrenamiento.
+        date: fecha YYYY-MM-DD en la que programarlo.
+        repeat_count: número de repeticiones (ej. 6 para "6x1000m").
+        work_distance_m: distancia de cada repetición en metros (usa esto
+            O work_duration_seconds, no ambos).
+        work_duration_seconds: duración de cada repetición en segundos
+            (alternativa a work_distance_m).
+        recovery_duration_seconds: duración de la recuperación entre
+            repeticiones, en segundos.
+        warmup_minutes: minutos de calentamiento antes de las series.
+        cooldown_minutes: minutos de enfriamiento después de las series.
+        pace_slow_min_per_km / pace_fast_min_per_km: rango de ritmo objetivo
+            para las repeticiones de trabajo, en minutos por km (ej. 4.17 y
+            4.0 para un objetivo de 4:10-4:00 min/km). Opcional.
+        hr_low_bpm / hr_high_bpm: rango de frecuencia cardiaca objetivo para
+            las repeticiones de trabajo, en pulsaciones por minuto. Opcional
+            (usa esto O el ritmo, normalmente no ambos a la vez).
+        sport: "running" o "cycling".
+
+    Nota: esta herramienta es más compleja y menos probada que las demás.
+    Si el resultado en Garmin no sale como esperas (por ejemplo el objetivo
+    de ritmo no aparece), dímelo para revisarlo.
+    """
+    client = get_client()
+
+    sport_map = {
+        "running": ("RunningWorkout", {"sportTypeId": 1, "sportTypeKey": "running"}),
+        "cycling": ("CyclingWorkout", {"sportTypeId": 2, "sportTypeKey": "cycling"}),
+    }
+    class_name, sport_info = sport_map.get(sport, sport_map["running"])
+    WorkoutClass = getattr(gc_workout, class_name, gc_workout.RunningWorkout)
+
+    steps = []
+    order = 1
+
+    warmup_step = gc_workout.create_warmup_step(warmup_minutes * 60, step_order=order)
+    steps.append(warmup_step)
+    order += 1
+
+    # Paso de trabajo (con objetivo de ritmo o FC si se ha indicado)
+    if work_distance_m:
+        work_step = gc_workout.create_distance_interval_step(
+            work_distance_m, step_order=1
+        )
+    else:
+        work_step = gc_workout.create_interval_step(
+            work_duration_seconds or 240, step_order=1
+        )
+    if pace_slow_min_per_km and pace_fast_min_per_km:
+        work_step.update(_pace_target(pace_slow_min_per_km, pace_fast_min_per_km))
+    elif hr_low_bpm and hr_high_bpm:
+        work_step.update(_hr_target(hr_low_bpm, hr_high_bpm))
+
+    recovery_step = gc_workout.create_recovery_step(
+        recovery_duration_seconds, step_order=2
+    )
+
+    repeat_group = gc_workout.create_repeat_group(
+        repeat_count, [work_step, recovery_step], step_order=order
+    )
+    steps.append(repeat_group)
+    order += 1
+
+    cooldown_step = gc_workout.create_cooldown_step(
+        cooldown_minutes * 60, step_order=order
+    )
+    steps.append(cooldown_step)
+
+    est_duration = (
+        warmup_minutes * 60
+        + repeat_count * ((work_duration_seconds or 240) + recovery_duration_seconds)
+        + cooldown_minutes * 60
+    )
+
+    workout = WorkoutClass(
+        workoutName=name,
+        estimatedDurationInSecs=est_duration,
+        workoutSegments=[
+            gc_workout.WorkoutSegment(
+                segmentOrder=1, sportType=sport_info, workoutSteps=steps
+            )
+        ],
+    )
+
+    upload_method = getattr(client, f"upload_{sport}_workout", None)
+    if upload_method is None:
+        upload_method = client.upload_running_workout
+
+    result = upload_method(workout)
+    client.schedule_workout(result["workoutId"], date)
+
+    return {
+        "status": "programado",
+        "workout_id": result["workoutId"],
+        "nombre": name,
+        "fecha": date,
+        "repeticiones": repeat_count,
     }
 
 
