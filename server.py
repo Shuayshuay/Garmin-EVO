@@ -20,6 +20,14 @@ import os
 import datetime
 from typing import Optional
 
+import os
+import base64
+import json
+import tempfile
+import datetime
+from pathlib import Path
+from typing import Optional
+
 from garminconnect import Garmin
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -36,9 +44,38 @@ mcp = FastMCP(
 _client: Optional[Garmin] = None
 
 
+def _login_with_saved_tokens() -> Optional[Garmin]:
+    """Si existe la variable de entorno GARMIN_TOKENS (generada con
+    local_login.py), inicia sesión reutilizando esa sesión guardada, sin
+    contraseña ni MFA."""
+    tokens_b64 = os.environ.get("GARMIN_TOKENS")
+    if not tokens_b64:
+        return None
+    try:
+        combined = json.loads(base64.b64decode(tokens_b64))
+        tmp_dir = Path(tempfile.mkdtemp())
+        for name, content in combined.items():
+            (tmp_dir / name).write_text(content)
+        client = Garmin()
+        client.login(str(tmp_dir))
+        return client
+    except Exception:
+        return None
+
+
 def get_client() -> Garmin:
     """Devuelve un cliente Garmin ya logueado, reutilizando sesión si puede."""
     global _client
+
+    if _client is None:
+        _client = _login_with_saved_tokens()
+
+    if _client is not None:
+        try:
+            _client.get_full_name()
+            return _client
+        except Exception:
+            _client = None
 
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
@@ -48,19 +85,9 @@ def get_client() -> Garmin:
             "en el hosting."
         )
 
-    if _client is None:
-        _client = Garmin(email, password)
-        _client.login()
-        return _client
-
-    # Comprobación ligera de que la sesión sigue viva; si no, relogin.
-    try:
-        _client.get_full_name()
-        return _client
-    except Exception:
-        _client = Garmin(email, password)
-        _client.login()
-        return _client
+    _client = Garmin(email, password)
+    _client.login()
+    return _client
 
 
 def _today() -> str:
