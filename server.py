@@ -51,16 +51,22 @@ def _login_with_saved_tokens() -> Optional[Garmin]:
     contraseña ni MFA."""
     tokens_b64 = os.environ.get("GARMIN_TOKENS")
     if not tokens_b64:
+        print("GARMIN_TOKENS no está definida, se omite el login por token.")
         return None
     try:
         combined = json.loads(base64.b64decode(tokens_b64))
+        print(f"GARMIN_TOKENS decodificada, archivos: {list(combined.keys())}")
         tmp_dir = Path(tempfile.mkdtemp())
         for name, content in combined.items():
             (tmp_dir / name).write_text(content)
         client = Garmin()
         client.login(str(tmp_dir))
+        print("Login con token guardado: OK")
         return client
     except Exception:
+        import traceback
+        print("Login con token guardado FALLÓ:")
+        traceback.print_exc()
         return None
 
 
@@ -68,15 +74,12 @@ def get_client() -> Garmin:
     """Devuelve un cliente Garmin ya logueado, reutilizando sesión si puede."""
     global _client
 
-    if _client is None:
-        _client = _login_with_saved_tokens()
-
     if _client is not None:
-        try:
-            _client.get_full_name()
-            return _client
-        except Exception:
-            _client = None
+        return _client
+
+    _client = _login_with_saved_tokens()
+    if _client is not None:
+        return _client
 
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
@@ -86,8 +89,10 @@ def get_client() -> Garmin:
             "en el hosting."
         )
 
+    print("Intentando login con email/contraseña (respaldo)...")
     _client = Garmin(email, password)
     _client.login()
+    print("Login con email/contraseña: OK")
     return _client
 
 
