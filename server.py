@@ -17,17 +17,15 @@ archivo):
 """
 
 import os
-import datetime
-from typing import Optional
-
-import os
 import base64
 import json
 import tempfile
+import traceback
 import datetime
 from pathlib import Path
 from typing import Optional
 
+import requests as http_requests
 from garminconnect import Garmin
 from garminconnect import workout as gc_workout
 from mcp.server.fastmcp import FastMCP
@@ -40,34 +38,65 @@ mcp = FastMCP(
     ),
 )
 
-# --- Sesión de Garmin, con reintento de login ---------------------------
+# --- Sesión de Garmin, con persistencia automática del token ------------
 
 _client: Optional[Garmin] = None
 
 
-def _login_with_saved_tokens() -> Optional[Garmin]:
-    """Si existe la variable de entorno GARMIN_TOKENS (generada con
-    local_login.py), inicia sesión reutilizando esa sesión guardada, sin
-    contraseña ni MFA."""
+def _prepare_tokens_dir() -> Path:
+    """Crea una carpeta temporal con los tokens guardados (si existe
+    GARMIN_TOKENS), lista para pasársela a Garmin().login()."""
+    tmp_dir = Path(tempfile.mkdtemp())
     tokens_b64 = os.environ.get("GARMIN_TOKENS")
-    if not tokens_b64:
-        print("GARMIN_TOKENS no está definida, se omite el login por token.")
-        return None
+    if tokens_b64:
+        try:
+            combined = json.loads(base64.b64decode(tokens_b64))
+            for name, content in combined.items():
+                (tmp_dir / name).write_text(content)
+            print(f"GARMIN_TOKENS cargada: {list(combined.keys())}")
+        except Exception:
+            print("No se pudo decodificar GARMIN_TOKENS, se ignora:")
+            traceback.print_exc()
+    else:
+        print("GARMIN_TOKENS no está definida todavía.")
+    return tmp_dir
+
+
+def _persist_tokens_to_render(tokens_dir: Path):
+    """Si están configuradas RENDER_API_KEY y RENDER_SERVICE_ID, guarda el
+    contenido actual de tokens_dir de vuelta en la variable de entorno
+    GARMIN_TOKENS de Render, para que sobreviva a reinicios del servicio
+    aunque Garmin haya rotado el token internamente."""
+    api_key = os.environ.get("RENDER_API_KEY")
+    service_id = os.environ.get("RENDER_SERVICE_ID")
+    if not api_key or not service_id:
+        print(
+            "RENDER_API_KEY/RENDER_SERVICE_ID no configuradas: no se "
+            "autopersiste el token (tendrás que regenerarlo a mano si caduca)."
+        )
+        return
     try:
-        combined = json.loads(base64.b64decode(tokens_b64))
-        print(f"GARMIN_TOKENS decodificada, archivos: {list(combined.keys())}")
-        tmp_dir = Path(tempfile.mkdtemp())
-        for name, content in combined.items():
-            (tmp_dir / name).write_text(content)
-        client = Garmin()
-        client.login(str(tmp_dir))
-        print("Login con token guardado: OK")
-        return client
+        combined = {}
+        for f in tokens_dir.iterdir():
+            if f.is_file():
+                combined[f.name] = f.read_text()
+        if not combined:
+            return
+        blob = base64.b64encode(json.dumps(combined).encode()).decode()
+        resp = http_requests.put(
+            f"https://api.render.com/v1/services/{service_id}/env-vars/GARMIN_TOKENS",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json={"value": blob},
+            timeout=10,
+        )
+        print(f"Autopersistencia de GARMIN_TOKENS en Render: HTTP {resp.status_code}")
     except Exception:
-        import traceback
-        print("Login con token guardado FALLÓ:")
+        print("Fallo al autopersistir GARMIN_TOKENS en Render:")
         traceback.print_exc()
-        return None
 
 
 def get_client() -> Garmin:
@@ -77,22 +106,21 @@ def get_client() -> Garmin:
     if _client is not None:
         return _client
 
-    _client = _login_with_saved_tokens()
-    if _client is not None:
-        return _client
+    tokens_dir = _prepare_tokens_dir()
 
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
-    if not email or not password:
-        raise RuntimeError(
-            "Faltan las variables de entorno GARMIN_EMAIL y/o GARMIN_PASSWORD "
-            "en el hosting."
-        )
+    if email and password:
+        client = Garmin(email=email, password=password)
+    else:
+        client = Garmin()
 
-    print("Intentando login con email/contraseña (respaldo)...")
-    _client = Garmin(email, password)
-    _client.login()
-    print("Login con email/contraseña: OK")
+    client.login(str(tokens_dir))
+    print("Login en Garmin: OK")
+
+    _persist_tokens_to_render(tokens_dir)
+
+    _client = client
     return _client
 
 
