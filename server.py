@@ -20,6 +20,7 @@ import os
 import base64
 import json
 import tempfile
+import threading
 import traceback
 import datetime
 from pathlib import Path
@@ -30,6 +31,8 @@ from garminconnect import Garmin
 from garminconnect import workout as gc_workout
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
 
 mcp = FastMCP(
     "garmin-mcp",
@@ -126,6 +129,104 @@ def get_client() -> Garmin:
 
 def _today() -> str:
     return datetime.date.today().isoformat()
+
+
+# --- Login manual por web (alternativa a usar el Mac) --------------------
+
+_login_state = {
+    "in_progress": False,
+    "waiting_for_mfa": False,
+    "mfa_event": None,
+    "mfa_code": None,
+    "result": None,
+}
+
+
+def _mfa_prompt() -> str:
+    event = threading.Event()
+    _login_state["mfa_event"] = event
+    _login_state["waiting_for_mfa"] = True
+    event.wait(timeout=300)  # hasta 5 min para introducir el código
+    _login_state["waiting_for_mfa"] = False
+    code = _login_state.get("mfa_code") or ""
+    _login_state["mfa_code"] = None
+    return code
+
+
+def _do_manual_login():
+    global _client
+    try:
+        tokens_dir = _prepare_tokens_dir()
+        email = os.environ.get("GARMIN_EMAIL")
+        password = os.environ.get("GARMIN_PASSWORD")
+        client = Garmin(email=email, password=password, prompt_mfa=_mfa_prompt)
+        client.login(str(tokens_dir))
+        _persist_tokens_to_render(tokens_dir)
+        _client = client
+        _login_state["result"] = "success"
+    except Exception as e:
+        _login_state["result"] = f"error: {e}"
+    finally:
+        _login_state["in_progress"] = False
+        _login_state["waiting_for_mfa"] = False
+
+
+_PAGE_STYLE = (
+    "font-family:-apple-system,sans-serif;max-width:420px;margin:60px auto;"
+    "padding:0 20px;text-align:center"
+)
+
+
+@mcp.custom_route("/login", methods=["GET"])
+async def login_page(request: Request) -> HTMLResponse:
+    state = _login_state
+    if state["waiting_for_mfa"]:
+        body = """
+        <h2>Código MFA</h2>
+        <p>Revisa tu email de Garmin y pega aquí el código:</p>
+        <form method="POST" action="/login/mfa">
+            <input name="code" autofocus style="font-size:1.2em;padding:8px">
+            <button type="submit" style="font-size:1.2em;padding:8px">Enviar</button>
+        </form>
+        """
+    elif state["in_progress"]:
+        body = "<h2>Iniciando sesión...</h2><p>Recarga esta página en unos segundos.</p>"
+    elif state["result"] == "success":
+        body = "<h2>✅ Listo</h2><p>Sesión de Garmin renovada correctamente.</p>"
+    elif state["result"]:
+        body = f"<h2>❌ Error</h2><p>{state['result']}</p><form method='POST' action='/login/start'><button style='font-size:1.1em;padding:8px'>Reintentar</button></form>"
+    else:
+        body = "<h2>Garmin Evo</h2><form method='POST' action='/login/start'><button style='font-size:1.2em;padding:10px 20px'>Iniciar sesión en Garmin</button></form>"
+
+    return HTMLResponse(f"<html><body style='{_PAGE_STYLE}'>{body}</body></html>")
+
+
+@mcp.custom_route("/login/start", methods=["POST"])
+async def login_start(request: Request) -> HTMLResponse:
+    if not _login_state["in_progress"]:
+        _login_state.update(
+            {"in_progress": True, "result": None, "waiting_for_mfa": False}
+        )
+        threading.Thread(target=_do_manual_login, daemon=True).start()
+    return HTMLResponse(
+        f"<html><body style='{_PAGE_STYLE}'>"
+        "<meta http-equiv='refresh' content='2;url=/login'>"
+        "<p>Iniciando...</p></body></html>"
+    )
+
+
+@mcp.custom_route("/login/mfa", methods=["POST"])
+async def login_mfa(request: Request) -> HTMLResponse:
+    form = await request.form()
+    _login_state["mfa_code"] = str(form.get("code", "")).strip()
+    event = _login_state.get("mfa_event")
+    if event:
+        event.set()
+    return HTMLResponse(
+        f"<html><body style='{_PAGE_STYLE}'>"
+        "<meta http-equiv='refresh' content='2;url=/login'>"
+        "<p>Comprobando código...</p></body></html>"
+    )
 
 
 # --- Herramientas expuestas a Claude -------------------------------------
